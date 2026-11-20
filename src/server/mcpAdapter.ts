@@ -989,6 +989,31 @@ export class LocalSitesMcpAdapter {
         'SELECT id, job_type FROM build_jobs WHERE website_id = $1 ORDER BY started_at DESC LIMIT 1',
         [websiteId]
       );
+      // Remote cost_usd is the combined provider cost, NOT a split between
+      // content and images. Record it separately; never fabricate a breakdown.
+      if (snapshot.costUsd !== null && existingJob.rows.length > 0 &&
+          ['create_website', 'retry_images'].includes(String(existingJob.rows[0].job_type))) {
+        const jobId = String(existingJob.rows[0].id);
+        const costRow = await pool.query(
+          `SELECT id FROM cost_entries WHERE job_id = $1 AND category = 'provider_total' LIMIT 1`,
+          [jobId]
+        );
+        if (costRow.rows.length > 0) {
+          await pool.query(
+            `UPDATE cost_entries SET actual_cost_usd = $1 WHERE id = $2`,
+            [snapshot.costUsd, costRow.rows[0].id]
+          );
+        } else {
+          await pool.query(
+            `INSERT INTO cost_entries
+              (id, website_id, job_id, category, provider_model, units, unit_label,
+               estimated_cost_usd, actual_cost_usd, is_demo)
+             VALUES ($1,$2,$3,'provider_total','LocalSites.pro (combined)',1,'build',0,$4,FALSE)`,
+            [crypto.randomUUID(), websiteId, jobId, snapshot.costUsd]
+          );
+        }
+      }
+
       if (existingJob.rows.length > 0) {
         await pool.query(
           `UPDATE build_jobs
@@ -1898,8 +1923,8 @@ async function createJobAndCosts(
       id, website_id, job_id, category, provider_model, units, unit_label,
       estimated_cost_usd, actual_cost_usd, is_demo
     ) VALUES
-      ($1,$2,$3,'content',$4,$5,'tokens',$6,$6,$9),
-      ($7,$2,$3,'image',$8,$10,'images',$11,$11,$9)`,
+      ($1,$2,$3,'content',$4,$5,'tokens',$6,$12,$9),
+      ($7,$2,$3,'image',$8,$10,'images',$11,$13,$9)`,
     [
       crypto.randomUUID(),
       website.id,
@@ -1912,6 +1937,8 @@ async function createJobAndCosts(
       isDemo,
       imageCount,
       imageCost,
+      isDemo ? contentCost : null,
+      isDemo ? imageCost : null,
     ]
   );
 
