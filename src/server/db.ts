@@ -144,6 +144,11 @@ async function initializeSchemaAndSeed(): Promise<void> {
         recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
 
+      -- Missing provider costs remain unknown rather than being reported as zero.
+      ALTER TABLE cost_entries ALTER COLUMN actual_cost_usd DROP NOT NULL;
+      UPDATE cost_entries SET actual_cost_usd = NULL
+        WHERE is_demo = FALSE AND actual_cost_usd = estimated_cost_usd;
+
       ALTER TABLE websites ADD COLUMN IF NOT EXISTS engine TEXT DEFAULT 'local';
       ALTER TABLE websites ADD COLUMN IF NOT EXISTS site_type TEXT DEFAULT 'city';
       ALTER TABLE websites ADD COLUMN IF NOT EXISTS indexed_pages INTEGER;
