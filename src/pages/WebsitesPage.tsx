@@ -63,6 +63,7 @@ export function WebsitesPage({
   const [actionBusy, setActionBusy] = useState<string | null>(null);
 
   const [cloneSource, setCloneSource] = useState<WebsiteRecord | null>(null);
+  const [clonePlan, setClonePlan] = useState<string | null>(null);
   const [cloneForm, setCloneForm] = useState({
     newBrandName: '',
     newDomain: '',
@@ -322,6 +323,7 @@ export function WebsitesPage({
 
   const openCloneModal = (site: WebsiteRecord) => {
     setCloneSource(site);
+    setClonePlan(null);
     setCloneForm({
       newBrandName: `${site.brandName} Metro`,
       newDomain: `metro-${site.domain}`,
@@ -335,20 +337,35 @@ export function WebsitesPage({
     if (!cloneSource) return;
     setActionBusy('clone');
     try {
-      const res = await apiRequest<{ website: WebsiteRecord }>(
-        '/api/mcp/clone-website',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            sourceWebsiteId: cloneSource.id,
-            ...cloneForm,
-          }),
-        }
-      );
-      setWebsites((prev) => [res.website, ...prev]);
-      setCloneSource(null);
-      onSelectWebsite(res.website.id);
-      pushToast(`Cloned ${res.website.brandName}`, 'success');
+      const dryRun = !clonePlan;
+      const res = await apiRequest<{
+        dryRun: boolean;
+        isDemo: boolean;
+        plan?: Record<string, unknown>;
+        website?: WebsiteRecord;
+      }>('/api/mcp/clone-website', {
+        method: 'POST',
+        body: JSON.stringify({
+          sourceWebsiteId: cloneSource.id,
+          ...cloneForm,
+          dryRun,
+        }),
+      });
+      if (dryRun) {
+        setClonePlan(JSON.stringify(res.plan || {}, null, 2));
+        pushToast('Clone dry-run ready for review', 'success');
+      } else if (res.website) {
+        setWebsites((prev) => [res.website!, ...prev]);
+        setCloneSource(null);
+        setClonePlan(null);
+        onSelectWebsite(res.website.id);
+        pushToast(
+          res.isDemo ? 'Demo clone draft created' : 'Clone draft created — not built yet',
+          'success'
+        );
+      } else {
+        throw new Error('LocalSites.pro did not return a created draft.');
+      }
     } catch (err) {
       pushToast(
         'Clone failed',
@@ -860,7 +877,7 @@ export function WebsitesPage({
               </h3>
               <button
                 type="button"
-                onClick={() => setCloneSource(null)}
+                onClick={() => { setCloneSource(null); setClonePlan(null); }}
                 className="p-1 text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200"
               >
                 <X className="w-4 h-4" />
@@ -881,7 +898,7 @@ export function WebsitesPage({
                   required
                   value={cloneForm.newBrandName}
                   onChange={(e) =>
-                    setCloneForm((p) => ({ ...p, newBrandName: e.target.value }))
+                    { setClonePlan(null); setCloneForm((p) => ({ ...p, newBrandName: e.target.value })); }
                   }
                   className="w-full rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950 px-3 py-2 text-sm"
                 />
@@ -893,7 +910,7 @@ export function WebsitesPage({
                   required
                   value={cloneForm.newDomain}
                   onChange={(e) =>
-                    setCloneForm((p) => ({ ...p, newDomain: e.target.value }))
+                    { setClonePlan(null); setCloneForm((p) => ({ ...p, newDomain: e.target.value })); }
                   }
                   className="w-full rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950 px-3 py-2 text-sm font-mono"
                 />
@@ -906,7 +923,7 @@ export function WebsitesPage({
                     required
                     value={cloneForm.locationCity}
                     onChange={(e) =>
-                      setCloneForm((p) => ({ ...p, locationCity: e.target.value }))
+                      { setClonePlan(null); setCloneForm((p) => ({ ...p, locationCity: e.target.value })); }
                     }
                     className="w-full rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950 px-3 py-2 text-sm"
                   />
@@ -928,10 +945,19 @@ export function WebsitesPage({
                   />
                 </div>
               </div>
+              {clonePlan && (
+                <div className="rounded-md border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/30 p-3">
+                  <div className="text-xs font-semibold mb-2">LocalSites.pro Clone Dry-run Plan</div>
+                  <pre className="text-[11px] whitespace-pre-wrap break-all max-h-52 overflow-auto">{clonePlan}</pre>
+                  <p className="text-[11px] mt-2 text-amber-700 dark:text-amber-300">
+                    Confirming creates a DRAFT only. No site build or image generation starts here.
+                  </p>
+                </div>
+              )}
               <div className="pt-2 flex justify-end gap-2">
                 <button
                   type="button"
-                  onClick={() => setCloneSource(null)}
+                  onClick={() => { setCloneSource(null); setClonePlan(null); }}
                   className="px-3.5 py-2 rounded-md border border-zinc-200 dark:border-zinc-800 text-xs font-medium"
                 >
                   Cancel
@@ -941,7 +967,7 @@ export function WebsitesPage({
                   disabled={actionBusy === 'clone'}
                   className="px-3.5 py-2 rounded-md bg-zinc-950 dark:bg-zinc-50 text-zinc-50 dark:text-zinc-950 text-xs font-medium"
                 >
-                  {actionBusy === 'clone' ? 'Cloning...' : 'Run clone_website'}
+                  {actionBusy === 'clone' ? 'Working...' : clonePlan ? 'Confirm Clone Draft' : 'Preview Clone Dry-run'}
                 </button>
               </div>
             </form>
