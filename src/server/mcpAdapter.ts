@@ -986,7 +986,7 @@ export class LocalSitesMcpAdapter {
       const liveUrl = snapshot.liveUrl;
 
       const existingJob = await pool.query(
-        'SELECT id FROM build_jobs WHERE website_id = $1 ORDER BY started_at DESC LIMIT 1',
+        'SELECT id, job_type FROM build_jobs WHERE website_id = $1 ORDER BY started_at DESC LIMIT 1',
         [websiteId]
       );
       if (existingJob.rows.length > 0) {
@@ -1027,25 +1027,27 @@ export class LocalSitesMcpAdapter {
         );
       }
 
+      // Status from LocalSites.pro is authoritative. Deployment finishes
+      // asynchronously; initial creation still requires QA before approval.
+      const latestType = String(existingJob.rows[0]?.job_type || 'create_website');
       if (isFailed) {
         await pool.query(
           `UPDATE websites SET status = 'failed', updated_at = NOW() WHERE id = $1`,
           [websiteId]
         );
-      } else if (isDone && liveUrl && snapshot.state === 'completed') {
-        await pool.query(
-          `UPDATE websites SET status = 'qa_review', workflow_stage = 'qa', published_url = $1, updated_at = NOW() WHERE id = $2`,
-          [liveUrl, websiteId]
-        );
       } else if (isDone) {
+        const isPublish = latestType === 'publish_website';
         await pool.query(
-          `UPDATE websites
-           SET status = CASE WHEN status = 'published' THEN 'published' ELSE 'qa_review' END,
-               workflow_stage = CASE WHEN status = 'published' THEN 'published' ELSE 'qa' END,
-               published_url = COALESCE($1, published_url),
-               updated_at = NOW()
-           WHERE id = $2`,
-          [liveUrl, websiteId]
+          `UPDATE websites SET
+            status = $1, workflow_stage = $2,
+            published_url = COALESCE($3, published_url),
+            updated_at = NOW() WHERE id = $4`,
+          [
+            isPublish ? 'published' : 'qa_review',
+            isPublish ? 'published' : 'qa',
+            liveUrl,
+            websiteId,
+          ]
         );
       }
     } else {
