@@ -1203,94 +1203,94 @@ export class LocalSitesMcpAdapter {
     newDomain: string;
     locationCity: string;
     locationState: string;
+    dryRun: boolean;
   }): Promise<{
     mode: McpTransportMode;
     isDemo: boolean;
-    website: WebsiteRecord;
-    job: BuildJobRecord;
+    dryRun: boolean;
+    plan?: Record<string, unknown>;
+    website?: WebsiteRecord;
+    job?: BuildJobRecord;
   }> {
     const settings = await getInternalSettings();
     await ensureDbReady();
     const source = await fetchWebsiteById(params.sourceWebsiteId);
-    const cleanDomain = params.newDomain
-      .trim()
-      .toLowerCase()
-      .replace(/^https?:\/\//, '')
-      .replace(/\/.*$/, '');
+    const cleanDomain = params.newDomain.trim().toLowerCase()
+      .replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    const isDemo = settings.transportMode === 'demo' || source.isDemo;
+    if (!isDemo && !source.externalMcpId) {
+      throw new Error('Clone requires a real LocalSites.pro source site ID.');
+    }
+    const remoteArgs = {
+      source_site_id: source.externalMcpId,
+      city: params.locationCity.trim(),
+      state: params.locationState.trim(),
+      company_name: params.newBrandName.trim(),
+      domain: cleanDomain,
+      dry_run: params.dryRun,
+    };
 
-    let externalMcpId: string | null = `demo_ls_${crypto.randomUUID().slice(0, 6)}`;
-    let isDemo = true;
-
-    if (settings.transportMode !== 'demo' && source.externalMcpId && !source.isDemo) {
-      // Exact LocalSites.pro clone_website schema (additionalProperties: false)
-      const remote = await withLiveMcpClient(settings, async (client) => {
-        const res = await client.callTool({
-          name: 'clone_website',
-          arguments: {
-            source_site_id: source.externalMcpId,
-            city: params.locationCity.trim(),
-            state: params.locationState.trim(),
-            company_name: params.newBrandName.trim(),
-            domain: cleanDomain,
-            dry_run: false,
-          },
+    const result = isDemo
+      ? { message: 'DEMO MODE clone preview; no remote site will be created.', changes: remoteArgs }
+      : await withLiveMcpClient(settings, async client => {
+          const response = await client.callTool({ name: 'clone_website', arguments: remoteArgs });
+          return parseMcpToolJson(response);
         });
-        return parseMcpToolJson(res);
-      });
-      externalMcpId =
-        typeof remote.site_id === 'string'
-          ? remote.site_id
-          : typeof remote.website_id === 'string'
-            ? remote.website_id
-            : externalMcpId;
-      isDemo = false;
+
+    if (params.dryRun) {
+      return { mode: settings.transportMode, isDemo, dryRun: true, plan: result };
+    }
+
+    const externalMcpId = isDemo
+      ? `demo_ls_${crypto.randomUUID().slice(0, 6)}`
+      : typeof result.site_id === 'string'
+        ? result.site_id
+        : typeof result.website_id === 'string' ? result.website_id : null;
+    if (!externalMcpId) {
+      throw new Error('Clone response lacks a site ID. Check LocalSites.pro before retrying to avoid duplicates.');
     }
 
     const newId = crypto.randomUUID();
-    const clonedAreas = [
-      `${params.locationCity}, ${params.locationState}`,
-      ...source.serviceAreas.slice(1),
-    ];
-
+    const clonedAreas = [`${params.locationCity}, ${params.locationState}`];
     await pool.query(
       `INSERT INTO websites (
         id, external_mcp_id, brand_name, domain, niche, location_city, location_state,
         keywords, services, service_areas, blog_topics, blueprint_id, workflow_stage, status,
         is_demo, dry_run_brief_json, disclosure_text
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,$12,'monitoring','building',$13,$14::jsonb,$15)`,
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,$12,'configuration','draft',$13,NULL,$14)`,
       [
-        newId,
-        externalMcpId,
-        params.newBrandName.trim(),
-        cleanDomain,
-        source.niche,
-        params.locationCity.trim(),
-        params.locationState.trim().toUpperCase(),
-        JSON.stringify(source.keywords),
-        JSON.stringify(source.services),
-        JSON.stringify(clonedAreas),
-        JSON.stringify(source.blogTopics),
-        source.blueprintId,
-        isDemo,
-        source.dryRunBrief ? JSON.stringify(source.dryRunBrief) : null,
-        source.disclosureText,
+        newId, externalMcpId, params.newBrandName.trim(), cleanDomain, source.niche,
+        params.locationCity.trim(), params.locationState.trim().toUpperCase(),
+        JSON.stringify(source.keywords), JSON.stringify(source.services),
+        JSON.stringify(clonedAreas), JSON.stringify(source.blogTopics),
+        source.blueprintId, isDemo, source.disclosureText,
       ]
     );
-
-    const clonedSite = await fetchWebsiteById(newId);
-    const job = await createJobAndCosts(
-      clonedSite,
-      settings,
-      'clone_website',
-      source.dryRunBrief,
-      isDemo
+    const jobId = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO build_jobs (
+        id, website_id, job_type, status, progress_pct, current_step,
+        mcp_mode, result_json, completed_at
+      ) VALUES ($1,$2,'clone_website','completed',100,$3,$4,$5::jsonb,NOW())`,
+      [
+        jobId, newId, isDemo
+          ? 'DEMO MODE: clone draft created (no build)'
+          : 'LocalSites.pro clone DRAFT created — content build not started',
+        settings.transportMode, JSON.stringify(result),
+      ]
     );
-
+    const clonedSite = await fetchWebsiteById(newId);
+    const jobResult = await pool.query(
+      `SELECT bj.*, w.brand_name AS website_brand, w.domain AS website_domain
+       FROM build_jobs bj JOIN websites w ON w.id = bj.website_id WHERE bj.id = $1`,
+      [jobId]
+    );
     return {
       mode: settings.transportMode,
       isDemo,
+      dryRun: false,
       website: clonedSite,
-      job,
+      job: mapJobRow(jobResult.rows[0]),
     };
   }
 
