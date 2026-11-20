@@ -1363,13 +1363,18 @@ export class LocalSitesMcpAdapter {
 
     if (settings.requireQaPassBeforePublish && !overrideQa) {
       const qaRes = await pool.query(
-        `SELECT COUNT(*)::int AS fail_count FROM qa_checks WHERE website_id = $1 AND status = 'fail'`,
+        `SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE status <> 'pass')::int AS blocking
+           FROM qa_checks WHERE website_id = $1`,
         [websiteId]
       );
-      const failCount = Number(qaRes.rows[0]?.fail_count ?? 0);
-      if (failCount > 0) {
+      const total = Number(qaRes.rows[0]?.total ?? 0);
+      const blocking = Number(qaRes.rows[0]?.blocking ?? 0);
+      if (total === 0 || blocking > 0) {
         throw new Error(
-          `Publish blocked: ${failCount} failing QA check(s) remain in QA Center.`
+          total === 0
+            ? 'Publish blocked: run a verified QA audit first.'
+            : `Publish blocked: ${blocking} QA warning/failure check(s) remain.`
         );
       }
     }
