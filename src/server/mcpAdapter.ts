@@ -767,6 +767,24 @@ export class LocalSitesMcpAdapter {
       (estimatedContentCostUsd + estimatedImageCostUsd).toFixed(2)
     );
 
+    if (!params.dryRun && settings.transportMode !== 'demo') {
+      // Reserve estimated spending before dispatch; the real provider can cost
+      // less or more, so this is a conservative budget guard, not a hard cap
+      // on the external provider account.
+      const monthSpend = await pool.query(
+        `SELECT COALESCE(SUM(GREATEST(estimated_cost_usd, COALESCE(actual_cost_usd, 0))),0)::float AS reserved
+         FROM cost_entries
+         WHERE is_demo = FALSE AND category <> 'provider_total'
+           AND recorded_at >= date_trunc('month', NOW())`
+      );
+      const reserved = Number(monthSpend.rows[0]?.reserved || 0);
+      if (reserved + estimatedTotalCostUsd > settings.monthlyBudgetLimitUsd) {
+        throw new Error(
+          `Monthly build budget would be exceeded: ${reserved.toFixed(2)} USD reserved + ${estimatedTotalCostUsd.toFixed(2)} USD estimated > ${settings.monthlyBudgetLimitUsd.toFixed(2)} USD limit.`
+        );
+      }
+    }
+
     if (settings.transportMode !== 'demo') {
       // Exact LocalSites.pro create_website schema (additionalProperties: false)
       const mcpArgs: Record<string, unknown> = {
@@ -1593,10 +1611,10 @@ export async function runFullQaAudit(websiteId: string): Promise<{
           category: 'link',
           key: 'link_integrity',
           title: 'Live internal navigation & robots indexability',
-          status: !httpOk || hasNoindex ? 'fail' : internalLinks >= 5 ? 'pass' : 'warn',
+          status: !httpOk ? 'fail' : internalLinks >= 5 ? 'pass' : 'warn',
           details: `HTTP ${resp.status} · ${internalLinks} internal link(s) discovered${hasNoindex ? ' · robots=noindex active' : ' · indexable'}.`,
           hint: hasNoindex
-            ? 'Clear noindex directive before submitting to Google Search Console.'
+            ? 'Preview is intentionally noindex; keep it until go-live approval.'
             : internalLinks < 5
               ? 'Verify navigation links to service & area pages.'
               : '',
@@ -1663,7 +1681,7 @@ export async function runFullQaAudit(websiteId: string): Promise<{
         category: 'seo',
         key: 'seo_meta',
         title: `Title tags, H1 hierarchy & ${website.locationState} schema markup`,
-        status: website.keywords.length >= 2 ? 'pass' : 'warn',
+        status: 'warn',
         details: `${website.keywords.length} target keywords mapped cleanly to H1/meta titles for ${website.locationCity}, ${website.locationState}.`,
         hint: website.keywords.length >= 2 ? '' : 'Add at least 2 target keywords.',
       },
@@ -1671,7 +1689,7 @@ export async function runFullQaAudit(websiteId: string): Promise<{
         category: 'content',
         key: 'content_depth',
         title: 'US loan education content depth & claim hygiene',
-        status: hasBlogs ? 'pass' : 'warn',
+        status: 'warn',
         details: hasBlogs
           ? `${website.services.length} service pillars and ${website.blogTopics.length} educational guides verified.`
           : `Only ${website.blogTopics.length} blog guide(s) configured; 2+ recommended for authority.`,
@@ -1681,15 +1699,15 @@ export async function runFullQaAudit(websiteId: string): Promise<{
         category: 'canonical',
         key: 'canonical_tags',
         title: `Canonical URL enforcement (https://${website.domain})`,
-        status: 'pass',
-        details: `All pages declare self-referencing https://${website.domain} canonical links.`,
+        status: 'warn',
+        details: `Expected canonical configuration cannot be verified without a reachable page. Previously assumed: https://${website.domain} canonical links.`,
         hint: '',
       },
       {
         category: 'disclosure',
         key: 'loan_disclosure',
         title: 'Non-lender educational & referral disclosure verification',
-        status: hasDisclosure ? 'pass' : 'fail',
+        status: 'warn',
         details: hasDisclosure
           ? 'Above-the-fold non-lender disclosure and state referral disclaimer confirmed.'
           : 'Missing compliant US loan referral & non-lender disclaimer text.',
@@ -1699,7 +1717,7 @@ export async function runFullQaAudit(websiteId: string): Promise<{
         category: 'image',
         key: 'image_assets',
         title: 'Hero & service illustration resolution + alt text',
-        status: failedImages > 0 ? 'fail' : 'pass',
+        status: failedImages > 0 ? 'fail' : 'warn',
         details:
           failedImages > 0
             ? `${failedImages} image asset(s) failed generation during build.`
@@ -1710,7 +1728,7 @@ export async function runFullQaAudit(websiteId: string): Promise<{
         category: 'link',
         key: 'link_integrity',
         title: 'Internal navigation, area links & referral CTA integrity',
-        status: hasAreas ? 'pass' : 'warn',
+        status: 'warn',
         details: hasAreas
           ? `${website.serviceAreas.length} geo area pages linked from hub navigation with zero 404s.`
           : 'No regional service area pages linked yet.',
@@ -1771,7 +1789,7 @@ export async function syncWebsiteQaSummary(websiteId: string): Promise<{
     warned,
     failed,
     total: checks.length,
-    readyToPublish: checks.length > 0 && failed === 0,
+    readyToPublish: checks.length > 0 && failed === 0 && warned === 0,
     lastRunAt: new Date().toISOString(),
   };
 
