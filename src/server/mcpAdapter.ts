@@ -1230,7 +1230,7 @@ export class LocalSitesMcpAdapter {
       dry_run: params.dryRun,
     };
 
-    const result = isDemo
+    const result: Record<string, unknown> = isDemo
       ? { message: 'DEMO MODE clone preview; no remote site will be created.', changes: remoteArgs }
       : await withLiveMcpClient(settings, async client => {
           const response = await client.callTool({ name: 'clone_website', arguments: remoteArgs });
