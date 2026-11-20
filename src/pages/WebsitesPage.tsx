@@ -266,7 +266,7 @@ export function WebsitesPage({
       setWebsites((prev) =>
         prev.map((w) => (w.id === site.id ? res.website : w))
       );
-      pushToast(`Image retry completed for ${site.brandName}`, 'success');
+      pushToast(`Image retry requested for ${site.brandName} — check status to verify assets`, 'info');
     } catch (err) {
       pushToast(
         'Image retry failed',
@@ -291,7 +291,7 @@ export function WebsitesPage({
       setWebsites((prev) =>
         prev.map((w) => (w.id === site.id ? res.website : w))
       );
-      pushToast(`Published ${site.brandName}`, 'success', res.publishedUrl);
+      pushToast(res.website.status === 'published' ? `Published ${site.brandName}` : `Deployment requested for ${site.brandName} — check status`, res.website.status === 'published' ? 'success' : 'info', res.publishedUrl || undefined);
     } catch (err) {
       pushToast(
         'Publish blocked',
