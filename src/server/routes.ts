@@ -489,6 +489,7 @@ apiRouter.post('/mcp/clone-website', async (req, res, next) => {
         newDomain: z.string().min(4),
         locationCity: z.string().min(2),
         locationState: z.string().min(2).max(4),
+        dryRun: z.boolean().default(true),
       })
       .safeParse(req.body);
     if (!parsed.success) {
