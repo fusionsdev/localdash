@@ -24,7 +24,7 @@ export function CostAnalyticsPage({
   const [entries, setEntries] = useState<CostEntryRecord[]>([]);
   const [perWebsite, setPerWebsite] = useState<PerWebsiteCost[]>([]);
   const [loading, setLoading] = useState(true);
-  const [catFilter, setCatFilter] = useState<'all' | 'content' | 'image'>('all');
+  const [catFilter, setCatFilter] = useState<'all' | 'content' | 'image' | 'provider_total'>('all');
   const [sourceFilter, setSourceFilter] = useState<'all' | 'live' | 'demo'>('all');
 
   useEffect(() => {
@@ -76,7 +76,7 @@ export function CostAnalyticsPage({
             Cost Analytics
           </h1>
           <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-1">
-            AI content generation and image rendering spend per US loan website, including dry-run variance.
+            Verified combined provider totals where reported; content/image breakdowns remain unknown until supplied by the provider.
           </p>
         </div>
 
@@ -107,25 +107,25 @@ export function CostAnalyticsPage({
       {/* Summary Strip */}
       <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
         <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4">
-          <div className="text-xs text-zinc-500">Total Actual Spend</div>
+          <div className="text-xs text-zinc-500">Reported Actual Spend</div>
           <div className="font-mono text-2xl font-semibold tabular-nums mt-2">
             {formatUsd(totals.actual)}
           </div>
         </div>
         <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4">
-          <div className="text-xs text-zinc-500">AI Content Generation</div>
+          <div className="text-xs text-zinc-500">Allocated Content Cost</div>
           <div className="font-mono text-2xl font-semibold tabular-nums mt-2">
             {formatUsd(totals.content)}
           </div>
         </div>
         <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4">
-          <div className="text-xs text-zinc-500">AI Image Rendering</div>
+          <div className="text-xs text-zinc-500">Allocated Image Cost</div>
           <div className="font-mono text-2xl font-semibold tabular-nums mt-2">
             {formatUsd(totals.image)}
           </div>
         </div>
         <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-4">
-          <div className="text-xs text-zinc-500">Dry-run Variance</div>
+          <div className="text-xs text-zinc-500">Reported vs Estimated</div>
           <div className="font-mono text-2xl font-semibold tabular-nums mt-2">
             {totals.actual - totals.estimated >= 0 ? '+' : ''}
             {formatUsd(totals.actual - totals.estimated)}
@@ -207,7 +207,7 @@ export function CostAnalyticsPage({
         <div className="px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-3">
           <h2 className="font-display text-sm font-semibold">Line-Item Ledger</h2>
           <div className="flex items-center gap-1 p-1 rounded bg-zinc-100 dark:bg-zinc-950">
-            {(['all', 'content', 'image'] as const).map((c) => (
+            {(['all', 'content', 'image', 'provider_total'] as const).map((c) => (
               <button
                 key={c}
                 type="button"
@@ -252,7 +252,7 @@ export function CostAnalyticsPage({
                     {formatNumber(e.units)} {e.unitLabel}
                   </td>
                   <td className="py-2.5 px-4 text-right font-mono font-semibold tabular-nums">
-                    {formatUsd(e.actualCostUsd)}
+                    {e.actualCostUsd === null ? 'Not reported' : formatUsd(e.actualCostUsd)}
                   </td>
                   <td className="py-2.5 px-4 text-right font-mono text-zinc-500">
                     {formatRelativeDate(e.recordedAt)}
