@@ -997,7 +997,9 @@ export class LocalSitesMcpAdapter {
       const snapshot = readRemoteBuild(remote);
       const pct = snapshot.progressPct;
       const isFailed = snapshot.state === 'failed';
-      const isDone = snapshot.state === 'completed';
+      const isDone = snapshot.state === 'completed' &&
+        !(snapshot.imageFailure && website.status === 'building' &&
+          String(remote.status || '').toLowerCase() === 'generating');
       const stepMsg = snapshot.imageFailure
         ? `${snapshot.currentStep} (image warning: ${snapshot.imageFailure})`
         : snapshot.currentStep;
@@ -1036,6 +1038,7 @@ export class LocalSitesMcpAdapter {
         await pool.query(
           `UPDATE build_jobs
            SET progress_pct = $1,
+               image_failures_count = $7,
                status = $2,
                current_step = $3,
                error_message = $4,
@@ -1049,6 +1052,7 @@ export class LocalSitesMcpAdapter {
             isFailed ? String(snapshot.error || stepMsg) : null,
             JSON.stringify(remote),
             existingJob.rows[0].id,
+            snapshot.imageFailure ? 1 : 0,
           ]
         );
       } else {
@@ -1433,8 +1437,8 @@ export async function runFullQaAudit(websiteId: string): Promise<{
   await ensureDbReady();
   const website = await fetchWebsiteById(websiteId);
   const failedImageRes = await pool.query(
-    `SELECT COALESCE(SUM(image_failures_count), 0)::int AS failed_imgs
-     FROM build_jobs WHERE website_id = $1 AND status = 'failed'`,
+    `SELECT COALESCE(image_failures_count, 0)::int AS failed_imgs
+     FROM build_jobs WHERE website_id = $1 ORDER BY started_at DESC LIMIT 1`,
     [websiteId]
   );
   const failedImages = Number(failedImageRes.rows[0]?.failed_imgs ?? 0);
