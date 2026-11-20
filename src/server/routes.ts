@@ -795,7 +795,7 @@ apiRouter.get('/costs', async (_req, res, next) => {
       units: Number(r.units || 0),
       unitLabel: String(r.unit_label || 'units'),
       estimatedCostUsd: Number(r.estimated_cost_usd || 0),
-      actualCostUsd: Number(r.actual_cost_usd || 0),
+      actualCostUsd: r.actual_cost_usd === null ? null : Number(r.actual_cost_usd),
       isDemo: Boolean(r.is_demo),
       recordedAt: new Date(String(r.recorded_at)).toISOString(),
     }));
