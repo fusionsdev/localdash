@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import {
   clearSessionCookie,
@@ -31,6 +32,32 @@ import type {
 } from '../shared/types.ts';
 
 export const apiRouter = express.Router();
+
+// Lightweight per-process limit for public owner authentication endpoints.
+// Production deployments with multiple instances should add edge rate limiting.
+const authAttempts = new Map<string, { count: number; expires: number }>();
+function authRateLimit(req: Request, res: Response, next: NextFunction): void {
+  const key = `${req.ip || req.socket.remoteAddress || 'unknown'}:${req.path}`;
+  const now = Date.now();
+  const entry = authAttempts.get(key);
+  if (!entry || entry.expires < now) {
+    authAttempts.set(key, { count: 1, expires: now + 15 * 60 * 1000 });
+    if (authAttempts.size > 2000) {
+      for (const [k, value] of authAttempts) {
+        if (value.expires < now) authAttempts.delete(k);
+      }
+    }
+    next();
+    return;
+  }
+  if (entry.count >= 8) {
+    res.status(429).json({ error: 'Too many attempts. Try again later.' });
+    return;
+  }
+  entry.count += 1;
+  next();
+}
+
 
 const createWebsiteSchema = z.object({
   websiteId: z.string().uuid().optional(),
@@ -109,7 +136,7 @@ apiRouter.get('/auth/status', async (req, res, next) => {
   }
 });
 
-apiRouter.post('/auth/setup', async (req, res, next) => {
+apiRouter.post('/auth/setup', authRateLimit, async (req, res, next) => {
   try {
     const state = await getAuthState(req);
     if (state.initialized) {
@@ -141,7 +168,7 @@ apiRouter.post('/auth/setup', async (req, res, next) => {
   }
 });
 
-apiRouter.post('/auth/login', async (req, res, next) => {
+apiRouter.post('/auth/login', authRateLimit, async (req, res, next) => {
   try {
     const state = await getAuthState(req);
     if (!state.initialized) {
