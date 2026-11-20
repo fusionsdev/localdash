@@ -935,12 +935,10 @@ export function WebsitesPage({
                     required
                     maxLength={2}
                     value={cloneForm.locationState}
-                    onChange={(e) =>
-                      setCloneForm((p) => ({
-                        ...p,
-                        locationState: e.target.value.toUpperCase(),
-                      }))
-                    }
+                    onChange={(e) => {
+                      setClonePlan(null);
+                      setCloneForm((p) => ({ ...p, locationState: e.target.value.toUpperCase() }));
+                    }}
                     className="w-full rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-950 px-3 py-2 text-sm font-mono"
                   />
                 </div>
