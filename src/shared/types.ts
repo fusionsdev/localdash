@@ -139,12 +139,12 @@ export interface CostEntryRecord {
   websiteBrand?: string;
   websiteDomain?: string;
   jobId: string | null;
-  category: 'content' | 'image';
+  category: 'content' | 'image' | 'provider_total';
   providerModel: string;
   units: number;
   unitLabel: string;
   estimatedCostUsd: number;
-  actualCostUsd: number;
+  actualCostUsd: number | null;
   isDemo: boolean;
   recordedAt: string;
 }

@@ -413,7 +413,7 @@ export function CreateWebsitePage({
         }
       );
       setActiveWebsite(res.website);
-      pushToast('Website published', 'success', res.publishedUrl);
+      pushToast(res.website.status === 'published' ? 'Website published' : 'Deployment requested — check status for completion', res.website.status === 'published' ? 'success' : 'info', res.publishedUrl || undefined);
     } catch (err) {
       pushToast(
         'Publish blocked',

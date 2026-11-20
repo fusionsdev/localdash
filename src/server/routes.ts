@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import express from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import {
   clearSessionCookie,
@@ -31,6 +32,32 @@ import type {
 } from '../shared/types.ts';
 
 export const apiRouter = express.Router();
+
+// Lightweight per-process limit for public owner authentication endpoints.
+// Production deployments with multiple instances should add edge rate limiting.
+const authAttempts = new Map<string, { count: number; expires: number }>();
+function authRateLimit(req: Request, res: Response, next: NextFunction): void {
+  const key = `${req.ip || req.socket.remoteAddress || 'unknown'}:${req.path}`;
+  const now = Date.now();
+  const entry = authAttempts.get(key);
+  if (!entry || entry.expires < now) {
+    authAttempts.set(key, { count: 1, expires: now + 15 * 60 * 1000 });
+    if (authAttempts.size > 2000) {
+      for (const [k, value] of authAttempts) {
+        if (value.expires < now) authAttempts.delete(k);
+      }
+    }
+    next();
+    return;
+  }
+  if (entry.count >= 8) {
+    res.status(429).json({ error: 'Too many attempts. Try again later.' });
+    return;
+  }
+  entry.count += 1;
+  next();
+}
+
 
 const createWebsiteSchema = z.object({
   websiteId: z.string().uuid().optional(),
@@ -109,7 +136,7 @@ apiRouter.get('/auth/status', async (req, res, next) => {
   }
 });
 
-apiRouter.post('/auth/setup', async (req, res, next) => {
+apiRouter.post('/auth/setup', authRateLimit, async (req, res, next) => {
   try {
     const state = await getAuthState(req);
     if (state.initialized) {
@@ -141,7 +168,7 @@ apiRouter.post('/auth/setup', async (req, res, next) => {
   }
 });
 
-apiRouter.post('/auth/login', async (req, res, next) => {
+apiRouter.post('/auth/login', authRateLimit, async (req, res, next) => {
   try {
     const state = await getAuthState(req);
     if (!state.initialized) {
@@ -462,6 +489,7 @@ apiRouter.post('/mcp/clone-website', async (req, res, next) => {
         newDomain: z.string().min(4),
         locationCity: z.string().min(2),
         locationState: z.string().min(2).max(4),
+        dryRun: z.boolean().default(true),
       })
       .safeParse(req.body);
     if (!parsed.success) {
@@ -795,7 +823,7 @@ apiRouter.get('/costs', async (_req, res, next) => {
       units: Number(r.units || 0),
       unitLabel: String(r.unit_label || 'units'),
       estimatedCostUsd: Number(r.estimated_cost_usd || 0),
-      actualCostUsd: Number(r.actual_cost_usd || 0),
+      actualCostUsd: r.actual_cost_usd === null ? null : Number(r.actual_cost_usd),
       isDemo: Boolean(r.is_demo),
       recordedAt: new Date(String(r.recorded_at)).toISOString(),
     }));

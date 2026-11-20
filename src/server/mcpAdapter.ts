@@ -4,6 +4,7 @@ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { ensureDbReady, pool } from './db.ts';
+import { readRemoteBrief, readRemoteBuild } from './mcpState.ts';
 import type {
   BuildJobRecord,
   CreateWebsiteInput,
@@ -766,6 +767,24 @@ export class LocalSitesMcpAdapter {
       (estimatedContentCostUsd + estimatedImageCostUsd).toFixed(2)
     );
 
+    if (!params.dryRun && settings.transportMode !== 'demo') {
+      // Reserve estimated spending before dispatch; the real provider can cost
+      // less or more, so this is a conservative budget guard, not a hard cap
+      // on the external provider account.
+      const monthSpend = await pool.query(
+        `SELECT COALESCE(SUM(GREATEST(estimated_cost_usd, COALESCE(actual_cost_usd, 0))),0)::float AS reserved
+         FROM cost_entries
+         WHERE is_demo = FALSE AND category <> 'provider_total'
+           AND recorded_at >= date_trunc('month', NOW())`
+      );
+      const reserved = Number(monthSpend.rows[0]?.reserved || 0);
+      if (reserved + estimatedTotalCostUsd > settings.monthlyBudgetLimitUsd) {
+        throw new Error(
+          `Monthly build budget would be exceeded: ${reserved.toFixed(2)} USD reserved + ${estimatedTotalCostUsd.toFixed(2)} USD estimated > ${settings.monthlyBudgetLimitUsd.toFixed(2)} USD limit.`
+        );
+      }
+    }
+
     if (settings.transportMode !== 'demo') {
       // Exact LocalSites.pro create_website schema (additionalProperties: false)
       const mcpArgs: Record<string, unknown> = {
@@ -822,18 +841,12 @@ export class LocalSitesMcpAdapter {
       });
 
       const websiteId = params.websiteId || crypto.randomUUID();
-      const remoteWarnings: string[] = [];
-      if (Array.isArray(remoteRes.warnings)) {
-        remoteWarnings.push(...remoteRes.warnings.map(String));
-      }
-      if (Array.isArray(remoteRes.missing_facts)) {
-        remoteWarnings.push(
-          ...remoteRes.missing_facts.map((f) => `Missing fact: ${String(f)}`)
-        );
-      }
+      const normalizedBrief = readRemoteBrief(remoteRes);
+      const remoteWarnings = normalizedBrief.warnings;
 
       const estPages = Number(
-        remoteRes.estimated_pages ?? remoteRes.total_pages ?? remoteRes.pages_count ?? totalPages
+        remoteRes.estimated_pages ?? remoteRes.total_pages ?? remoteRes.pages_count ??
+        normalizedBrief.pages ?? totalPages
       );
       const estImages = Number(
         remoteRes.estimated_images ?? remoteRes.images_count ?? totalImages
@@ -862,7 +875,7 @@ export class LocalSitesMcpAdapter {
         complianceNotes: [
           'Live LocalSites.pro MCP dry-run brief verified',
           'US non-lender educational publisher & referral disclosure included',
-          'Canonical tags enforced to root HTTPS domain',
+          'Canonical tags must be checked on the deployed preview before indexing',
         ],
         warnings: remoteWarnings,
         rawMcpSummary:
@@ -981,42 +994,51 @@ export class LocalSitesMcpAdapter {
       });
       remoteDetails = remote;
 
-      const remoteStatusRaw = String(remote.status || '').toLowerCase();
-      const pct =
-        typeof remote.progress_pct === 'number'
-          ? remote.progress_pct
-          : typeof remote.progress === 'number'
-            ? remote.progress
-            : remoteStatusRaw.includes('complete') ||
-                remoteStatusRaw.includes('ready') ||
-                remoteStatusRaw.includes('live') ||
-                remoteStatusRaw.includes('published')
-              ? 100
-              : 50;
-
-      const isFailed = remoteStatusRaw.includes('fail') || remoteStatusRaw.includes('error');
-      const isDone = !isFailed && (pct >= 100 || remoteStatusRaw.includes('ready') || remoteStatusRaw.includes('live') || remoteStatusRaw.includes('published'));
-      const stepMsg = String(
-        remote.current_step ||
-          remote.stage ||
-          remote.message ||
-          `LocalSites.pro status: ${remote.status || 'synced'}`
-      );
-      const liveUrl =
-        typeof remote.live_url === 'string' && remote.live_url
-          ? remote.live_url
-          : typeof remote.url === 'string' && remote.url
-            ? remote.url
-            : null;
+      const snapshot = readRemoteBuild(remote);
+      const pct = snapshot.progressPct;
+      const isFailed = snapshot.state === 'failed';
+      const isDone = snapshot.state === 'completed' &&
+        !(snapshot.imageFailure && website.status === 'building' &&
+          String(remote.status || '').toLowerCase() === 'generating');
+      const stepMsg = snapshot.imageFailure
+        ? `${snapshot.currentStep} (image warning: ${snapshot.imageFailure})`
+        : snapshot.currentStep;
+      const liveUrl = snapshot.liveUrl;
 
       const existingJob = await pool.query(
-        'SELECT id FROM build_jobs WHERE website_id = $1 ORDER BY started_at DESC LIMIT 1',
+        'SELECT id, job_type FROM build_jobs WHERE website_id = $1 ORDER BY started_at DESC LIMIT 1',
         [websiteId]
       );
+      // Remote cost_usd is the combined provider cost, NOT a split between
+      // content and images. Record it separately; never fabricate a breakdown.
+      if (snapshot.costUsd !== null && existingJob.rows.length > 0 &&
+          ['create_website', 'retry_images'].includes(String(existingJob.rows[0].job_type))) {
+        const jobId = String(existingJob.rows[0].id);
+        const costRow = await pool.query(
+          `SELECT id FROM cost_entries WHERE job_id = $1 AND category = 'provider_total' LIMIT 1`,
+          [jobId]
+        );
+        if (costRow.rows.length > 0) {
+          await pool.query(
+            `UPDATE cost_entries SET actual_cost_usd = $1 WHERE id = $2`,
+            [snapshot.costUsd, costRow.rows[0].id]
+          );
+        } else {
+          await pool.query(
+            `INSERT INTO cost_entries
+              (id, website_id, job_id, category, provider_model, units, unit_label,
+               estimated_cost_usd, actual_cost_usd, is_demo)
+             VALUES ($1,$2,$3,'provider_total','LocalSites.pro (combined)',1,'build',0,$4,FALSE)`,
+            [crypto.randomUUID(), websiteId, jobId, snapshot.costUsd]
+          );
+        }
+      }
+
       if (existingJob.rows.length > 0) {
         await pool.query(
           `UPDATE build_jobs
            SET progress_pct = $1,
+               image_failures_count = $7,
                status = $2,
                current_step = $3,
                error_message = $4,
@@ -1027,9 +1049,10 @@ export class LocalSitesMcpAdapter {
             isDone ? 100 : pct,
             isFailed ? 'failed' : isDone ? 'completed' : 'running',
             stepMsg,
-            isFailed ? String(remote.error || stepMsg) : null,
+            isFailed ? String(snapshot.error || stepMsg) : null,
             JSON.stringify(remote),
             existingJob.rows[0].id,
+            snapshot.imageFailure ? 1 : 0,
           ]
         );
       } else {
@@ -1051,25 +1074,27 @@ export class LocalSitesMcpAdapter {
         );
       }
 
+      // Status from LocalSites.pro is authoritative. Deployment finishes
+      // asynchronously; initial creation still requires QA before approval.
+      const latestType = String(existingJob.rows[0]?.job_type || 'create_website');
       if (isFailed) {
         await pool.query(
           `UPDATE websites SET status = 'failed', updated_at = NOW() WHERE id = $1`,
           [websiteId]
         );
-      } else if (liveUrl && (remoteStatusRaw.includes('live') || remoteStatusRaw.includes('published'))) {
-        await pool.query(
-          `UPDATE websites SET status = 'published', workflow_stage = 'published', published_url = $1, updated_at = NOW() WHERE id = $2`,
-          [liveUrl, websiteId]
-        );
       } else if (isDone) {
+        const isPublish = latestType === 'publish_website';
         await pool.query(
-          `UPDATE websites
-           SET status = CASE WHEN status = 'published' THEN 'published' ELSE 'qa_review' END,
-               workflow_stage = CASE WHEN status = 'published' THEN 'published' ELSE 'qa' END,
-               published_url = COALESCE($1, published_url),
-               updated_at = NOW()
-           WHERE id = $2`,
-          [liveUrl, websiteId]
+          `UPDATE websites SET
+            status = $1, workflow_stage = $2,
+            published_url = COALESCE($3, published_url),
+            updated_at = NOW() WHERE id = $4`,
+          [
+            isPublish ? 'published' : 'qa_review',
+            isPublish ? 'published' : 'qa',
+            liveUrl,
+            websiteId,
+          ]
         );
       }
     } else {
@@ -1178,94 +1203,94 @@ export class LocalSitesMcpAdapter {
     newDomain: string;
     locationCity: string;
     locationState: string;
+    dryRun: boolean;
   }): Promise<{
     mode: McpTransportMode;
     isDemo: boolean;
-    website: WebsiteRecord;
-    job: BuildJobRecord;
+    dryRun: boolean;
+    plan?: Record<string, unknown>;
+    website?: WebsiteRecord;
+    job?: BuildJobRecord;
   }> {
     const settings = await getInternalSettings();
     await ensureDbReady();
     const source = await fetchWebsiteById(params.sourceWebsiteId);
-    const cleanDomain = params.newDomain
-      .trim()
-      .toLowerCase()
-      .replace(/^https?:\/\//, '')
-      .replace(/\/.*$/, '');
+    const cleanDomain = params.newDomain.trim().toLowerCase()
+      .replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+    const isDemo = settings.transportMode === 'demo' || source.isDemo;
+    if (!isDemo && !source.externalMcpId) {
+      throw new Error('Clone requires a real LocalSites.pro source site ID.');
+    }
+    const remoteArgs = {
+      source_site_id: source.externalMcpId,
+      city: params.locationCity.trim(),
+      state: params.locationState.trim(),
+      company_name: params.newBrandName.trim(),
+      domain: cleanDomain,
+      dry_run: params.dryRun,
+    };
 
-    let externalMcpId: string | null = `demo_ls_${crypto.randomUUID().slice(0, 6)}`;
-    let isDemo = true;
-
-    if (settings.transportMode !== 'demo' && source.externalMcpId && !source.isDemo) {
-      // Exact LocalSites.pro clone_website schema (additionalProperties: false)
-      const remote = await withLiveMcpClient(settings, async (client) => {
-        const res = await client.callTool({
-          name: 'clone_website',
-          arguments: {
-            source_site_id: source.externalMcpId,
-            city: params.locationCity.trim(),
-            state: params.locationState.trim(),
-            company_name: params.newBrandName.trim(),
-            domain: cleanDomain,
-            dry_run: false,
-          },
+    const result: Record<string, unknown> = isDemo
+      ? { message: 'DEMO MODE clone preview; no remote site will be created.', changes: remoteArgs }
+      : await withLiveMcpClient(settings, async client => {
+          const response = await client.callTool({ name: 'clone_website', arguments: remoteArgs });
+          return parseMcpToolJson(response);
         });
-        return parseMcpToolJson(res);
-      });
-      externalMcpId =
-        typeof remote.site_id === 'string'
-          ? remote.site_id
-          : typeof remote.website_id === 'string'
-            ? remote.website_id
-            : externalMcpId;
-      isDemo = false;
+
+    if (params.dryRun) {
+      return { mode: settings.transportMode, isDemo, dryRun: true, plan: result };
+    }
+
+    const externalMcpId = isDemo
+      ? `demo_ls_${crypto.randomUUID().slice(0, 6)}`
+      : typeof result.site_id === 'string'
+        ? result.site_id
+        : typeof result.website_id === 'string' ? result.website_id : null;
+    if (!externalMcpId) {
+      throw new Error('Clone response lacks a site ID. Check LocalSites.pro before retrying to avoid duplicates.');
     }
 
     const newId = crypto.randomUUID();
-    const clonedAreas = [
-      `${params.locationCity}, ${params.locationState}`,
-      ...source.serviceAreas.slice(1),
-    ];
-
+    const clonedAreas = [`${params.locationCity}, ${params.locationState}`];
     await pool.query(
       `INSERT INTO websites (
         id, external_mcp_id, brand_name, domain, niche, location_city, location_state,
         keywords, services, service_areas, blog_topics, blueprint_id, workflow_stage, status,
         is_demo, dry_run_brief_json, disclosure_text
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,$12,'monitoring','building',$13,$14::jsonb,$15)`,
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,$10::jsonb,$11::jsonb,$12,'configuration','draft',$13,NULL,$14)`,
       [
-        newId,
-        externalMcpId,
-        params.newBrandName.trim(),
-        cleanDomain,
-        source.niche,
-        params.locationCity.trim(),
-        params.locationState.trim().toUpperCase(),
-        JSON.stringify(source.keywords),
-        JSON.stringify(source.services),
-        JSON.stringify(clonedAreas),
-        JSON.stringify(source.blogTopics),
-        source.blueprintId,
-        isDemo,
-        source.dryRunBrief ? JSON.stringify(source.dryRunBrief) : null,
-        source.disclosureText,
+        newId, externalMcpId, params.newBrandName.trim(), cleanDomain, source.niche,
+        params.locationCity.trim(), params.locationState.trim().toUpperCase(),
+        JSON.stringify(source.keywords), JSON.stringify(source.services),
+        JSON.stringify(clonedAreas), JSON.stringify(source.blogTopics),
+        source.blueprintId, isDemo, source.disclosureText,
       ]
     );
-
-    const clonedSite = await fetchWebsiteById(newId);
-    const job = await createJobAndCosts(
-      clonedSite,
-      settings,
-      'clone_website',
-      source.dryRunBrief,
-      isDemo
+    const jobId = crypto.randomUUID();
+    await pool.query(
+      `INSERT INTO build_jobs (
+        id, website_id, job_type, status, progress_pct, current_step,
+        mcp_mode, result_json, completed_at
+      ) VALUES ($1,$2,'clone_website','completed',100,$3,$4,$5::jsonb,NOW())`,
+      [
+        jobId, newId, isDemo
+          ? 'DEMO MODE: clone draft created (no build)'
+          : 'LocalSites.pro clone DRAFT created — content build not started',
+        settings.transportMode, JSON.stringify(result),
+      ]
     );
-
+    const clonedSite = await fetchWebsiteById(newId);
+    const jobResult = await pool.query(
+      `SELECT bj.*, w.brand_name AS website_brand, w.domain AS website_domain
+       FROM build_jobs bj JOIN websites w ON w.id = bj.website_id WHERE bj.id = $1`,
+      [jobId]
+    );
     return {
       mode: settings.transportMode,
       isDemo,
+      dryRun: false,
       website: clonedSite,
-      job,
+      job: mapJobRow(jobResult.rows[0]),
     };
   }
 
@@ -1278,57 +1303,36 @@ export class LocalSitesMcpAdapter {
     const settings = await getInternalSettings();
     await ensureDbReady();
     const website = await fetchWebsiteById(websiteId);
+    const isDemo = settings.transportMode === 'demo' || website.isDemo;
 
-    if (settings.transportMode !== 'demo' && website.externalMcpId && !website.isDemo) {
-      await withLiveMcpClient(settings, async (client) => {
-        const res = await client.callTool({
-          name: 'retry_website_images',
-          arguments: { site_id: website.externalMcpId },
-        });
-        parseMcpToolJson(res);
-      });
+    if (!isDemo && !website.externalMcpId) {
+      throw new Error('Cannot retry images: remote LocalSites.pro site ID is missing.');
     }
 
+    let remote: Record<string, unknown> = {};
+    if (!isDemo && website.externalMcpId) {
+      remote = await withLiveMcpClient(settings, async client => {
+        const res = await client.callTool({
+          name: 'retry_website_images',
+          arguments: { site_id: website.externalMcpId! },
+        });
+        return parseMcpToolJson(res);
+      });
+    }
+    // A retry can be asynchronous. Only the remote status endpoint can confirm
+    // generated assets; never claim success or bill synthetic actual costs here.
     const jobId = crypto.randomUUID();
     await pool.query(
       `INSERT INTO build_jobs (
         id, website_id, job_type, status, progress_pct, current_step,
-        image_failures_count, error_message, mcp_mode, completed_at
-      ) VALUES ($1,$2,'retry_images','completed',100,'Retried failed image generation slots and verified asset URLs',0,NULL,$3,NOW())`,
-      [jobId, websiteId, settings.transportMode]
-    );
-
-    await pool.query(
-      `UPDATE build_jobs
-       SET image_failures_count = 0, error_message = NULL
-       WHERE website_id = $1 AND status = 'failed'`,
-      [websiteId]
-    );
-
-    await pool.query(
-      `UPDATE websites
-       SET status = CASE WHEN status = 'failed' THEN 'qa_review' ELSE status END,
-           workflow_stage = CASE WHEN status = 'failed' THEN 'qa' ELSE workflow_stage END,
-           updated_at = NOW()
-       WHERE id = $1`,
-      [websiteId]
-    );
-
-    await pool.query(
-      `INSERT INTO cost_entries (
-        id, website_id, job_id, category, provider_model, units, unit_label,
-        estimated_cost_usd, actual_cost_usd, is_demo
-      ) VALUES ($1,$2,$3,'image',$4,2,'images',0.40,0.40,$5)`,
+        image_failures_count, error_message, mcp_mode, result_json
+      ) VALUES ($1,$2,'retry_images',$3,$4,$5,0,NULL,$6,$7::jsonb)`,
       [
-        crypto.randomUUID(),
-        websiteId,
-        jobId,
-        settings.imageModel,
-        settings.transportMode === 'demo' || website.isDemo,
+        jobId, websiteId, isDemo ? 'completed' : 'running', isDemo ? 100 : 0,
+        isDemo ? 'DEMO MODE: image retry simulated' : 'Image retry requested; awaiting remote verification',
+        settings.transportMode, JSON.stringify(remote),
       ]
     );
-
-    await runFullQaAudit(websiteId);
 
     const updatedSite = await fetchWebsiteById(websiteId);
     const jobRes = await pool.query(
@@ -1336,10 +1340,9 @@ export class LocalSitesMcpAdapter {
        FROM build_jobs bj JOIN websites w ON w.id = bj.website_id WHERE bj.id = $1`,
       [jobId]
     );
-
     return {
       mode: settings.transportMode,
-      isDemo: settings.transportMode === 'demo' || updatedSite.isDemo,
+      isDemo,
       website: updatedSite,
       job: mapJobRow(jobRes.rows[0]),
     };
@@ -1360,25 +1363,34 @@ export class LocalSitesMcpAdapter {
 
     if (settings.requireQaPassBeforePublish && !overrideQa) {
       const qaRes = await pool.query(
-        `SELECT COUNT(*)::int AS fail_count FROM qa_checks WHERE website_id = $1 AND status = 'fail'`,
+        `SELECT COUNT(*)::int AS total,
+                COUNT(*) FILTER (WHERE status <> 'pass')::int AS blocking
+           FROM qa_checks WHERE website_id = $1`,
         [websiteId]
       );
-      const failCount = Number(qaRes.rows[0]?.fail_count ?? 0);
-      if (failCount > 0) {
+      const total = Number(qaRes.rows[0]?.total ?? 0);
+      const blocking = Number(qaRes.rows[0]?.blocking ?? 0);
+      if (total === 0 || blocking > 0) {
         throw new Error(
-          `Publish blocked: ${failCount} failing QA check(s) remain in QA Center.`
+          total === 0
+            ? 'Publish blocked: run a verified QA audit first.'
+            : `Publish blocked: ${blocking} QA warning/failure check(s) remain.`
         );
       }
     }
 
-    let publishedUrl = website.publishedUrl || `https://${website.domain}`;
-    let isDemo = settings.transportMode === 'demo' || website.isDemo;
+    const isDemo = settings.transportMode === 'demo' || website.isDemo;
+    if (!isDemo && !website.externalMcpId) {
+      throw new Error('Cannot publish: remote LocalSites.pro site ID is missing.');
+    }
 
-    if (settings.transportMode !== 'demo' && website.externalMcpId && !website.isDemo) {
-      const remote = await withLiveMcpClient(settings, async (client) => {
+    let publishedUrl = website.publishedUrl;
+    let remote: Record<string, unknown> = {};
+    if (!isDemo && website.externalMcpId) {
+      remote = await withLiveMcpClient(settings, async client => {
         const res = await client.callTool({
           name: 'publish_website',
-          arguments: { site_id: website.externalMcpId },
+          arguments: { site_id: website.externalMcpId! },
         });
         return parseMcpToolJson(res);
       });
@@ -1387,39 +1399,38 @@ export class LocalSitesMcpAdapter {
       } else if (typeof remote.published_url === 'string' && remote.published_url) {
         publishedUrl = remote.published_url;
       }
-      isDemo = false;
     }
 
-    await pool.query(
-      `UPDATE websites
-       SET status = 'published',
-           workflow_stage = 'published',
-           published_url = $1,
-           updated_at = NOW()
-       WHERE id = $2`,
-      [publishedUrl, websiteId]
-    );
-
+    const jobId = crypto.randomUUID();
+    // Live publish queues a remote deployment. Do not mark Published until
+    // get_website_status verifies a successful remote build/deploy.
     await pool.query(
       `INSERT INTO build_jobs (
         id, website_id, job_type, status, progress_pct, current_step,
-        image_failures_count, mcp_mode, completed_at
-      ) VALUES ($1,$2,'publish_website','completed',100,$3,0,$4,NOW())`,
+        image_failures_count, mcp_mode, result_json, completed_at
+      ) VALUES ($1,$2,'publish_website',$3,$4,$5,0,$6,$7::jsonb,$8)`,
       [
-        crypto.randomUUID(),
-        websiteId,
-        isDemo
-          ? `Published in DEMO MODE to ${publishedUrl}`
-          : `Deployed to Cloudflare Pages via LocalSites.pro (${publishedUrl})`,
-        settings.transportMode,
+        jobId, websiteId, isDemo ? 'completed' : 'running', isDemo ? 100 : 0,
+        isDemo ? 'Published in DEMO MODE' : 'Deployment requested; awaiting LocalSites.pro confirmation',
+        settings.transportMode, JSON.stringify(remote), isDemo ? new Date().toISOString() : null,
       ]
     );
-
+    await pool.query(
+      `UPDATE websites SET status = $1, workflow_stage = $2,
+       published_url = COALESCE($3, published_url), updated_at = NOW()
+       WHERE id = $4`,
+      [
+        isDemo ? 'published' : 'building',
+        isDemo ? 'published' : 'monitoring',
+        isDemo ? (publishedUrl || `https://${website.domain}`) : publishedUrl,
+        websiteId,
+      ]
+    );
     return {
       mode: settings.transportMode,
       isDemo,
       website: await fetchWebsiteById(websiteId),
-      publishedUrl,
+      publishedUrl: publishedUrl || '',
     };
   }
 }
@@ -1431,8 +1442,8 @@ export async function runFullQaAudit(websiteId: string): Promise<{
   await ensureDbReady();
   const website = await fetchWebsiteById(websiteId);
   const failedImageRes = await pool.query(
-    `SELECT COALESCE(SUM(image_failures_count), 0)::int AS failed_imgs
-     FROM build_jobs WHERE website_id = $1 AND status = 'failed'`,
+    `SELECT COALESCE(image_failures_count, 0)::int AS failed_imgs
+     FROM build_jobs WHERE website_id = $1 ORDER BY started_at DESC LIMIT 1`,
     [websiteId]
   );
   const failedImages = Number(failedImageRes.rows[0]?.failed_imgs ?? 0);
@@ -1609,10 +1620,10 @@ export async function runFullQaAudit(websiteId: string): Promise<{
           category: 'link',
           key: 'link_integrity',
           title: 'Live internal navigation & robots indexability',
-          status: !httpOk || hasNoindex ? 'fail' : internalLinks >= 5 ? 'pass' : 'warn',
+          status: !httpOk ? 'fail' : internalLinks >= 5 ? 'pass' : 'warn',
           details: `HTTP ${resp.status} · ${internalLinks} internal link(s) discovered${hasNoindex ? ' · robots=noindex active' : ' · indexable'}.`,
           hint: hasNoindex
-            ? 'Clear noindex directive before submitting to Google Search Console.'
+            ? 'Preview is intentionally noindex; keep it until go-live approval.'
             : internalLinks < 5
               ? 'Verify navigation links to service & area pages.'
               : '',
@@ -1679,7 +1690,7 @@ export async function runFullQaAudit(websiteId: string): Promise<{
         category: 'seo',
         key: 'seo_meta',
         title: `Title tags, H1 hierarchy & ${website.locationState} schema markup`,
-        status: website.keywords.length >= 2 ? 'pass' : 'warn',
+        status: 'warn',
         details: `${website.keywords.length} target keywords mapped cleanly to H1/meta titles for ${website.locationCity}, ${website.locationState}.`,
         hint: website.keywords.length >= 2 ? '' : 'Add at least 2 target keywords.',
       },
@@ -1687,7 +1698,7 @@ export async function runFullQaAudit(websiteId: string): Promise<{
         category: 'content',
         key: 'content_depth',
         title: 'US loan education content depth & claim hygiene',
-        status: hasBlogs ? 'pass' : 'warn',
+        status: 'warn',
         details: hasBlogs
           ? `${website.services.length} service pillars and ${website.blogTopics.length} educational guides verified.`
           : `Only ${website.blogTopics.length} blog guide(s) configured; 2+ recommended for authority.`,
@@ -1697,15 +1708,15 @@ export async function runFullQaAudit(websiteId: string): Promise<{
         category: 'canonical',
         key: 'canonical_tags',
         title: `Canonical URL enforcement (https://${website.domain})`,
-        status: 'pass',
-        details: `All pages declare self-referencing https://${website.domain} canonical links.`,
+        status: 'warn',
+        details: `Expected canonical configuration cannot be verified without a reachable page. Previously assumed: https://${website.domain} canonical links.`,
         hint: '',
       },
       {
         category: 'disclosure',
         key: 'loan_disclosure',
         title: 'Non-lender educational & referral disclosure verification',
-        status: hasDisclosure ? 'pass' : 'fail',
+        status: 'warn',
         details: hasDisclosure
           ? 'Above-the-fold non-lender disclosure and state referral disclaimer confirmed.'
           : 'Missing compliant US loan referral & non-lender disclaimer text.',
@@ -1715,7 +1726,7 @@ export async function runFullQaAudit(websiteId: string): Promise<{
         category: 'image',
         key: 'image_assets',
         title: 'Hero & service illustration resolution + alt text',
-        status: failedImages > 0 ? 'fail' : 'pass',
+        status: failedImages > 0 ? 'fail' : 'warn',
         details:
           failedImages > 0
             ? `${failedImages} image asset(s) failed generation during build.`
@@ -1726,7 +1737,7 @@ export async function runFullQaAudit(websiteId: string): Promise<{
         category: 'link',
         key: 'link_integrity',
         title: 'Internal navigation, area links & referral CTA integrity',
-        status: hasAreas ? 'pass' : 'warn',
+        status: 'warn',
         details: hasAreas
           ? `${website.serviceAreas.length} geo area pages linked from hub navigation with zero 404s.`
           : 'No regional service area pages linked yet.',
@@ -1787,7 +1798,7 @@ export async function syncWebsiteQaSummary(websiteId: string): Promise<{
     warned,
     failed,
     total: checks.length,
-    readyToPublish: checks.length > 0 && failed === 0,
+    readyToPublish: checks.length > 0 && failed === 0 && warned === 0,
     lastRunAt: new Date().toISOString(),
   };
 
@@ -1939,8 +1950,8 @@ async function createJobAndCosts(
       id, website_id, job_id, category, provider_model, units, unit_label,
       estimated_cost_usd, actual_cost_usd, is_demo
     ) VALUES
-      ($1,$2,$3,'content',$4,$5,'tokens',$6,$6,$9),
-      ($7,$2,$3,'image',$8,$10,'images',$11,$11,$9)`,
+      ($1,$2,$3,'content',$4,$5,'tokens',$6,$12,$9),
+      ($7,$2,$3,'image',$8,$10,'images',$11,$13,$9)`,
     [
       crypto.randomUUID(),
       website.id,
@@ -1953,6 +1964,8 @@ async function createJobAndCosts(
       isDemo,
       imageCount,
       imageCost,
+      isDemo ? contentCost : null,
+      isDemo ? imageCost : null,
     ]
   );
 
