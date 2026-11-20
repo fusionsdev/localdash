@@ -4,6 +4,7 @@ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { ensureDbReady, pool } from './db.ts';
+import { readRemoteBrief, readRemoteBuild } from './mcpState.ts';
 import type {
   BuildJobRecord,
   CreateWebsiteInput,
@@ -822,18 +823,12 @@ export class LocalSitesMcpAdapter {
       });
 
       const websiteId = params.websiteId || crypto.randomUUID();
-      const remoteWarnings: string[] = [];
-      if (Array.isArray(remoteRes.warnings)) {
-        remoteWarnings.push(...remoteRes.warnings.map(String));
-      }
-      if (Array.isArray(remoteRes.missing_facts)) {
-        remoteWarnings.push(
-          ...remoteRes.missing_facts.map((f) => `Missing fact: ${String(f)}`)
-        );
-      }
+      const normalizedBrief = readRemoteBrief(remoteRes);
+      const remoteWarnings = normalizedBrief.warnings;
 
       const estPages = Number(
-        remoteRes.estimated_pages ?? remoteRes.total_pages ?? remoteRes.pages_count ?? totalPages
+        remoteRes.estimated_pages ?? remoteRes.total_pages ?? remoteRes.pages_count ??
+        normalizedBrief.pages ?? totalPages
       );
       const estImages = Number(
         remoteRes.estimated_images ?? remoteRes.images_count ?? totalImages
@@ -862,7 +857,7 @@ export class LocalSitesMcpAdapter {
         complianceNotes: [
           'Live LocalSites.pro MCP dry-run brief verified',
           'US non-lender educational publisher & referral disclosure included',
-          'Canonical tags enforced to root HTTPS domain',
+          'Canonical tags must be checked on the deployed preview before indexing',
         ],
         warnings: remoteWarnings,
         rawMcpSummary:
@@ -981,33 +976,14 @@ export class LocalSitesMcpAdapter {
       });
       remoteDetails = remote;
 
-      const remoteStatusRaw = String(remote.status || '').toLowerCase();
-      const pct =
-        typeof remote.progress_pct === 'number'
-          ? remote.progress_pct
-          : typeof remote.progress === 'number'
-            ? remote.progress
-            : remoteStatusRaw.includes('complete') ||
-                remoteStatusRaw.includes('ready') ||
-                remoteStatusRaw.includes('live') ||
-                remoteStatusRaw.includes('published')
-              ? 100
-              : 50;
-
-      const isFailed = remoteStatusRaw.includes('fail') || remoteStatusRaw.includes('error');
-      const isDone = !isFailed && (pct >= 100 || remoteStatusRaw.includes('ready') || remoteStatusRaw.includes('live') || remoteStatusRaw.includes('published'));
-      const stepMsg = String(
-        remote.current_step ||
-          remote.stage ||
-          remote.message ||
-          `LocalSites.pro status: ${remote.status || 'synced'}`
-      );
-      const liveUrl =
-        typeof remote.live_url === 'string' && remote.live_url
-          ? remote.live_url
-          : typeof remote.url === 'string' && remote.url
-            ? remote.url
-            : null;
+      const snapshot = readRemoteBuild(remote);
+      const pct = snapshot.progressPct;
+      const isFailed = snapshot.state === 'failed';
+      const isDone = snapshot.state === 'completed';
+      const stepMsg = snapshot.imageFailure
+        ? `${snapshot.currentStep} (image warning: ${snapshot.imageFailure})`
+        : snapshot.currentStep;
+      const liveUrl = snapshot.liveUrl;
 
       const existingJob = await pool.query(
         'SELECT id FROM build_jobs WHERE website_id = $1 ORDER BY started_at DESC LIMIT 1',
@@ -1027,7 +1003,7 @@ export class LocalSitesMcpAdapter {
             isDone ? 100 : pct,
             isFailed ? 'failed' : isDone ? 'completed' : 'running',
             stepMsg,
-            isFailed ? String(remote.error || stepMsg) : null,
+            isFailed ? String(snapshot.error || stepMsg) : null,
             JSON.stringify(remote),
             existingJob.rows[0].id,
           ]
@@ -1056,9 +1032,9 @@ export class LocalSitesMcpAdapter {
           `UPDATE websites SET status = 'failed', updated_at = NOW() WHERE id = $1`,
           [websiteId]
         );
-      } else if (liveUrl && (remoteStatusRaw.includes('live') || remoteStatusRaw.includes('published'))) {
+      } else if (isDone && liveUrl && snapshot.state === 'completed') {
         await pool.query(
-          `UPDATE websites SET status = 'published', workflow_stage = 'published', published_url = $1, updated_at = NOW() WHERE id = $2`,
+          `UPDATE websites SET status = 'qa_review', workflow_stage = 'qa', published_url = $1, updated_at = NOW() WHERE id = $2`,
           [liveUrl, websiteId]
         );
       } else if (isDone) {
