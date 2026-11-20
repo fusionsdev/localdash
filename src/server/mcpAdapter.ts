@@ -1254,57 +1254,36 @@ export class LocalSitesMcpAdapter {
     const settings = await getInternalSettings();
     await ensureDbReady();
     const website = await fetchWebsiteById(websiteId);
+    const isDemo = settings.transportMode === 'demo' || website.isDemo;
 
-    if (settings.transportMode !== 'demo' && website.externalMcpId && !website.isDemo) {
-      await withLiveMcpClient(settings, async (client) => {
-        const res = await client.callTool({
-          name: 'retry_website_images',
-          arguments: { site_id: website.externalMcpId },
-        });
-        parseMcpToolJson(res);
-      });
+    if (!isDemo && !website.externalMcpId) {
+      throw new Error('Cannot retry images: remote LocalSites.pro site ID is missing.');
     }
 
+    let remote: Record<string, unknown> = {};
+    if (!isDemo && website.externalMcpId) {
+      remote = await withLiveMcpClient(settings, async client => {
+        const res = await client.callTool({
+          name: 'retry_website_images',
+          arguments: { site_id: website.externalMcpId! },
+        });
+        return parseMcpToolJson(res);
+      });
+    }
+    // A retry can be asynchronous. Only the remote status endpoint can confirm
+    // generated assets; never claim success or bill synthetic actual costs here.
     const jobId = crypto.randomUUID();
     await pool.query(
       `INSERT INTO build_jobs (
         id, website_id, job_type, status, progress_pct, current_step,
-        image_failures_count, error_message, mcp_mode, completed_at
-      ) VALUES ($1,$2,'retry_images','completed',100,'Retried failed image generation slots and verified asset URLs',0,NULL,$3,NOW())`,
-      [jobId, websiteId, settings.transportMode]
-    );
-
-    await pool.query(
-      `UPDATE build_jobs
-       SET image_failures_count = 0, error_message = NULL
-       WHERE website_id = $1 AND status = 'failed'`,
-      [websiteId]
-    );
-
-    await pool.query(
-      `UPDATE websites
-       SET status = CASE WHEN status = 'failed' THEN 'qa_review' ELSE status END,
-           workflow_stage = CASE WHEN status = 'failed' THEN 'qa' ELSE workflow_stage END,
-           updated_at = NOW()
-       WHERE id = $1`,
-      [websiteId]
-    );
-
-    await pool.query(
-      `INSERT INTO cost_entries (
-        id, website_id, job_id, category, provider_model, units, unit_label,
-        estimated_cost_usd, actual_cost_usd, is_demo
-      ) VALUES ($1,$2,$3,'image',$4,2,'images',0.40,0.40,$5)`,
+        image_failures_count, error_message, mcp_mode, result_json
+      ) VALUES ($1,$2,'retry_images',$3,$4,$5,0,NULL,$6,$7::jsonb)`,
       [
-        crypto.randomUUID(),
-        websiteId,
-        jobId,
-        settings.imageModel,
-        settings.transportMode === 'demo' || website.isDemo,
+        jobId, websiteId, isDemo ? 'completed' : 'running', isDemo ? 100 : 0,
+        isDemo ? 'DEMO MODE: image retry simulated' : 'Image retry requested; awaiting remote verification',
+        settings.transportMode, JSON.stringify(remote),
       ]
     );
-
-    await runFullQaAudit(websiteId);
 
     const updatedSite = await fetchWebsiteById(websiteId);
     const jobRes = await pool.query(
@@ -1312,10 +1291,9 @@ export class LocalSitesMcpAdapter {
        FROM build_jobs bj JOIN websites w ON w.id = bj.website_id WHERE bj.id = $1`,
       [jobId]
     );
-
     return {
       mode: settings.transportMode,
-      isDemo: settings.transportMode === 'demo' || updatedSite.isDemo,
+      isDemo,
       website: updatedSite,
       job: mapJobRow(jobRes.rows[0]),
     };
@@ -1347,14 +1325,18 @@ export class LocalSitesMcpAdapter {
       }
     }
 
-    let publishedUrl = website.publishedUrl || `https://${website.domain}`;
-    let isDemo = settings.transportMode === 'demo' || website.isDemo;
+    const isDemo = settings.transportMode === 'demo' || website.isDemo;
+    if (!isDemo && !website.externalMcpId) {
+      throw new Error('Cannot publish: remote LocalSites.pro site ID is missing.');
+    }
 
-    if (settings.transportMode !== 'demo' && website.externalMcpId && !website.isDemo) {
-      const remote = await withLiveMcpClient(settings, async (client) => {
+    let publishedUrl = website.publishedUrl;
+    let remote: Record<string, unknown> = {};
+    if (!isDemo && website.externalMcpId) {
+      remote = await withLiveMcpClient(settings, async client => {
         const res = await client.callTool({
           name: 'publish_website',
-          arguments: { site_id: website.externalMcpId },
+          arguments: { site_id: website.externalMcpId! },
         });
         return parseMcpToolJson(res);
       });
@@ -1363,39 +1345,38 @@ export class LocalSitesMcpAdapter {
       } else if (typeof remote.published_url === 'string' && remote.published_url) {
         publishedUrl = remote.published_url;
       }
-      isDemo = false;
     }
 
-    await pool.query(
-      `UPDATE websites
-       SET status = 'published',
-           workflow_stage = 'published',
-           published_url = $1,
-           updated_at = NOW()
-       WHERE id = $2`,
-      [publishedUrl, websiteId]
-    );
-
+    const jobId = crypto.randomUUID();
+    // Live publish queues a remote deployment. Do not mark Published until
+    // get_website_status verifies a successful remote build/deploy.
     await pool.query(
       `INSERT INTO build_jobs (
         id, website_id, job_type, status, progress_pct, current_step,
-        image_failures_count, mcp_mode, completed_at
-      ) VALUES ($1,$2,'publish_website','completed',100,$3,0,$4,NOW())`,
+        image_failures_count, mcp_mode, result_json, completed_at
+      ) VALUES ($1,$2,'publish_website',$3,$4,$5,0,$6,$7::jsonb,$8)`,
       [
-        crypto.randomUUID(),
-        websiteId,
-        isDemo
-          ? `Published in DEMO MODE to ${publishedUrl}`
-          : `Deployed to Cloudflare Pages via LocalSites.pro (${publishedUrl})`,
-        settings.transportMode,
+        jobId, websiteId, isDemo ? 'completed' : 'running', isDemo ? 100 : 0,
+        isDemo ? 'Published in DEMO MODE' : 'Deployment requested; awaiting LocalSites.pro confirmation',
+        settings.transportMode, JSON.stringify(remote), isDemo ? new Date().toISOString() : null,
       ]
     );
-
+    await pool.query(
+      `UPDATE websites SET status = $1, workflow_stage = $2,
+       published_url = COALESCE($3, published_url), updated_at = NOW()
+       WHERE id = $4`,
+      [
+        isDemo ? 'published' : 'building',
+        isDemo ? 'published' : 'monitoring',
+        isDemo ? (publishedUrl || `https://${website.domain}`) : publishedUrl,
+        websiteId,
+      ]
+    );
     return {
       mode: settings.transportMode,
       isDemo,
       website: await fetchWebsiteById(websiteId),
-      publishedUrl,
+      publishedUrl: publishedUrl || '',
     };
   }
 }
