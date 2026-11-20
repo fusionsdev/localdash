@@ -146,8 +146,7 @@ async function initializeSchemaAndSeed(): Promise<void> {
 
       -- Missing provider costs remain unknown rather than being reported as zero.
       ALTER TABLE cost_entries ALTER COLUMN actual_cost_usd DROP NOT NULL;
-      UPDATE cost_entries SET actual_cost_usd = NULL
-        WHERE is_demo = FALSE AND actual_cost_usd = estimated_cost_usd;
+      -- Historical entries are left intact; new live jobs use NULL until verified.
 
       ALTER TABLE websites ADD COLUMN IF NOT EXISTS engine TEXT DEFAULT 'local';
       ALTER TABLE websites ADD COLUMN IF NOT EXISTS site_type TEXT DEFAULT 'city';
